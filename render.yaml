@@ -2,11 +2,13 @@ services:
   - type: web
     name: world264-bot
     env: python
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "python world264_realtime2.py --poll 30 --limit 35 --force"
     plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python main.py"
     envVars:
       - key: LINE_CHANNEL_ACCESS_TOKEN
         sync: false
       - key: LINE_GROUP_IDS
         sync: false
+      - key: TZ
+        value: Asia/Bangkok
