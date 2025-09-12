@@ -1,61 +1,110 @@
-# world264_realtime2.py
+# world264_realtime2.py  (Telegram version)
 import os, time, argparse
 from datetime import date, timedelta
 from typing import List, Tuple
 from dotenv import load_dotenv
 
-import format_world264_range as fw  # ใช้ของเดิมที่คุณดึงได้ปกติ
+import format_world264_range as fw  # ใช้ตัวเดิมของคุณ
 
 load_dotenv()
 
-TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
-RECIPIENTS = [s.strip() for s in os.getenv("LINE_GROUP_IDS", "").split(",") if s.strip()]
+# ---------- ENV ----------
+# โปรดตั้งค่าใน .env:
+# TELEGRAM_BOT_TOKEN=123456:ABC...
+# TELEGRAM_CHAT_IDS=-1001234567890,123456789
+TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TG_CHAT_IDS = [s.strip() for s in os.getenv("TELEGRAM_CHAT_IDS", "").split(",") if s.strip()]
 
-# -------- LINE push (ตรง ๆ) --------
-try:
-    from line_messaging import line_multicast
-    HAVE_HELPER = True
-except Exception:
-    HAVE_HELPER = False
-    import httpx
+import httpx
 
-def line_push(text: str):
-    if not RECIPIENTS:
-        print("[WARN] no recipients (LINE_GROUP_IDS)"); return
-    if HAVE_HELPER:
-        try:
-            line_multicast(RECIPIENTS, text); print("✅ sent by helper"); return
-        except Exception as e:
-            print("[WARN] helper failed -> http:", e)
-    if not TOKEN:
-        print("[ERR] no LINE_CHANNEL_ACCESS_TOKEN"); return
-    headers = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
-    body = lambda to, t: {"to": to, "messages":[{"type":"text","text": t[:4900]}]}
-    with httpx.Client(timeout=20) as c:  # type: ignore
-        for gid in RECIPIENTS:
-            r = c.post("https://api.line.me/v2/bot/message/push", headers=headers, json=body(gid, text))
-            print("[push]", gid, r.status_code, r.text[:160])
+API_BASE = lambda t: f"https://api.telegram.org/bot{t}"
 
-# -------- WORLD264 helpers --------
+def tg_send(text: str, chat_id: str | int, parse_mode: str | None = None):
+    if not TG_TOKEN:
+        print("[ERR] no TELEGRAM_BOT_TOKEN"); return None
+    payload = {
+        "chat_id": chat_id,
+        "text": text[:4000],              # กันยาวเกิน
+        "disable_web_page_preview": True
+    }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    with httpx.Client(timeout=20) as c:
+        r = c.post(f"{API_BASE(TG_TOKEN)}/sendMessage", json=payload)
+        if r.status_code == 429:
+            wait = r.json().get("parameters", {}).get("retry_after", 1)
+            print(f"[429] flood control → sleep {wait}s")
+            time.sleep(wait)
+            return tg_send(text, chat_id, parse_mode)
+        if r.status_code >= 400:
+            print(f"[tg_send ERR] {r.status_code} {r.text[:200]}")
+            return None
+        return r.json()
+
+def tg_edit(chat_id: str | int, message_id: int, new_text: str, parse_mode: str | None = None):
+    if not TG_TOKEN:
+        print("[ERR] no TELEGRAM_BOT_TOKEN"); return None
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": new_text[:4000],
+        "disable_web_page_preview": True
+    }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    with httpx.Client(timeout=20) as c:
+        r = c.post(f"{API_BASE(TG_TOKEN)}/editMessageText", json=payload)
+        if r.status_code == 429:
+            wait = r.json().get("parameters", {}).get("retry_after", 1)
+            print(f"[429] flood control (edit) → sleep {wait}s")
+            time.sleep(wait)
+            return tg_edit(chat_id, message_id, new_text, parse_mode)
+        if r.status_code >= 400:
+            print(f"[tg_edit WARN] {r.status_code} {r.text[:200]} → fallback send")
+            return tg_send(new_text, chat_id, parse_mode)
+        return r.json()
+
+def tg_broadcast(text: str, keep_edit: bool = True):
+    """
+    ส่งหาหลายแชท:
+      - รอบแรก: sendMessage แล้วจำ message_id ไว้ (ต่อแชท)
+      - รอบถัดไป: editMessageText เพื่อลดสแปม
+    """
+    if not TG_CHAT_IDS:
+        print("[WARN] no TELEGRAM_CHAT_IDS"); return {}
+
+    results = {}
+    for cid in TG_CHAT_IDS:
+        state = _message_states.get(cid)
+        if keep_edit and state and "message_id" in state:
+            resp = tg_edit(cid, state["message_id"], text)
+            if resp and "result" in resp and "message_id" in resp["result"]:
+                state["message_id"] = resp["result"]["message_id"]
+                results[cid] = state["message_id"]
+        else:
+            resp = tg_send(text, cid)
+            if resp and "result" in resp and "message_id" in resp["result"]:
+                _message_states[cid] = {"message_id": resp["result"]["message_id"]}
+                results[cid] = resp["result"]["message_id"]
+    return results
+
+_message_states: dict[str | int, dict] = {}
+
+# ---------- WORLD264 helpers ----------
 Row = Tuple[int, str, str, str]  # (round, hhmm, top3, bot2)
 
 def has_result(t: Row) -> bool:
     return bool((t[2] or "").strip()) and bool((t[3] or "").strip())
 
 def fetch_rows_for(d: date) -> List[Row]:
-    """
-    ดึงผ่านฟังก์ชันใน format_world264_range.py เท่านั้น (ของคุณดึงได้จริง)
-    กรองเฉพาะรอบที่ครบผล แล้ว 'เรียงตามเลขรอบ' เสมอ
-    """
-    data = fw.fetch_json(d)            # ← ใช้ของเดิม
-    key  = fw.pick_world264_key(data)  # ← ใช้ของเดิม
+    data = fw.fetch_json(d)
+    key  = fw.pick_world264_key(data)
     if not key: return []
     rows = [t for t in fw.extract_rows(data, key) if has_result(t)]
     rows.sort(key=lambda t: t[0])
     return rows
 
 def build_message(rows, limit: int = 40, add_footer: bool = True) -> str:
-    # คงลำดับจากรอบน้อย -> มาก และตัดแค่ N รอบล่าสุด
     rows = sorted(rows, key=lambda t: t[0])[-max(1, limit):]
 
     lines = ["🟢World Lotto 5นาที🟢\n"
@@ -65,7 +114,6 @@ def build_message(rows, limit: int = 40, add_footer: bool = True) -> str:
         if idx % 4 == 0:
             lines.append("➖➖➖➖➖➖➖")
 
-    # ฟุตเตอร์สรุปผลรอบล่าสุด ตามฟอร์แมตที่ต้องการ
     if add_footer and rows:
         rn, hhmm, top3, bot2 = rows[-1]
         footer = (
@@ -79,7 +127,7 @@ def build_message(rows, limit: int = 40, add_footer: bool = True) -> str:
 
     return "\n".join(lines)
 
-# -------- main loop --------
+# ---------- main loop ----------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--poll", type=int, default=20)
@@ -98,7 +146,6 @@ def main():
 
     while True:
         try:
-            # บางวันไฟล์อาจยังไม่พร้อมช่วงตี 0 → ลองถอยไปวันก่อนชั่วคราว
             try_days = [cur_day, cur_day - timedelta(days=1)]
             rows_all: List[Row] = []
             for d in try_days:
@@ -113,14 +160,13 @@ def main():
                 if not window:
                     window = rows_all[-limit:]
                     if args.force:
-                        line_push(build_message(window, limit))
+                        tg_broadcast(build_message(window, limit))
                         last_sent_round = window[-1][0]
                         print(f"[SEND] force up to round={last_sent_round}")
 
-                # รอบใหม่ = รอบที่หมายเลขมากกว่า last_sent_round เท่านั้น
+                # รอบใหม่
                 new_rows = [t for t in rows_all if t[0] > last_sent_round]
                 if new_rows:
-                    # กันซ้ำ/กันลำดับเพี้ยน
                     seen = {t[0] for t in window}
                     new_rows = [t for t in new_rows if t[0] not in seen]
                     new_rows.sort(key=lambda t: t[0])
@@ -128,14 +174,13 @@ def main():
                     if new_rows:
                         window.extend(new_rows)
                         window = sorted(window, key=lambda t: t[0])[-limit:]
-                        line_push(build_message(window, limit))
+                        tg_broadcast(build_message(window, limit))
                         last_sent_round = window[-1][0]
                         print(f"[SEND] up to round={last_sent_round}")
 
         except Exception as e:
             print("[ERR]", e)
 
-        # เปลี่ยนวัน → รีเซ็ต
         if date.today() != cur_day:
             cur_day = date.today()
             last_sent_round = 0
