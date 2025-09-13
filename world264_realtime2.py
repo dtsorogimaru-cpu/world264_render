@@ -2,15 +2,19 @@
 # -*- coding: utf-8 -*-
 """
 WORLD264 realtime → ส่งเข้า Telegram / LINE
-รูปแบบข้อความ: ล็อคบล็อก 4 รอบเสมอ (1–4, 5–8, 9–12, ...)
-บล็อกเก่าไม่ขยับ ไม่เลื่อนเป็นหน้าต่าง
+- จัดข้อความแบบ "ล็อกบล็อก 4 รอบ": 1–4, 5–8, 9–12, ...
+- กันส่งซ้ำด้วย last_sent_round
+- Telegram: จำกัดแสดง 50 รอบล่าสุด (เพื่อไม่ชนข้อจำกัดความยาวข้อความของ Telegram)
+- LINE: ส่งได้ทั้งวันตามปกติ (ถ้าต้องการจำกัดเหมือนกันให้ตั้ง LIMIT_LINE_ROUNDS ใน ENV ได้)
 
-ENV ที่อ่าน (อันไหนไม่ตั้ง จะไม่ส่งช่องทางนั้น)
-- TELEGRAM_BOT_TOKEN
-- TELEGRAM_CHAT_IDS            (คั่นหลาย id ด้วย ,)
-- LINE_CHANNEL_ACCESS_TOKEN
-- LINE_GROUP_IDS               (คั่นหลาย id ด้วย ,)
-- TZ / POLL_SEC (ออปชัน)
+ENV:
+  TELEGRAM_BOT_TOKEN
+  TELEGRAM_CHAT_IDS              (คั่นหลาย id ด้วย ,)
+  LINE_CHANNEL_ACCESS_TOKEN
+  LINE_GROUP_IDS                 (คั่นหลาย id ด้วย ,)
+  POLL_SEC (ออปชัน, default 20)
+  LIMIT_TG_ROUNDS (ออปชัน, default 50)
+  LIMIT_LINE_ROUNDS (ออปชัน, ไม่ตั้ง = ส่งเต็ม)
 """
 
 import os
@@ -20,7 +24,7 @@ from datetime import date, timedelta
 from typing import List, Tuple
 
 from dotenv import load_dotenv
-import format_world264_range as fw   # ต้องมีไฟล์นี้อยู่ข้าง ๆ
+import format_world264_range as fw   # ต้องมีไฟล์นี้อยู่
 
 load_dotenv()
 
@@ -30,6 +34,10 @@ TG_CHATS    = [s.strip() for s in os.getenv("TELEGRAM_CHAT_IDS", "").split(",") 
 
 LINE_TOKEN  = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
 LINE_TO     = [s.strip() for s in os.getenv("LINE_GROUP_IDS", "").split(",") if s.strip()]
+
+LIMIT_TG    = int(os.getenv("LIMIT_TG_ROUNDS", "50"))     # << จำกัด Telegram 50 รอบ
+LIMIT_LINE  = os.getenv("LIMIT_LINE_ROUNDS", "").strip()
+LIMIT_LINE  = int(LIMIT_LINE) if LIMIT_LINE.isdigit() else None
 
 Row = Tuple[int, str, str, str]  # (round, hh:mm, top3, bot2)
 
@@ -44,7 +52,7 @@ def send_telegram(text: str):
             try:
                 r = c.post(url, data={
                     "chat_id": chat,
-                    "text": text[:4000],
+                    "text": text[:4000],  # TG ~4096
                     "disable_web_page_preview": True
                 })
                 if r.status_code != 200:
@@ -67,10 +75,6 @@ def send_line(text: str):
             except Exception as e:
                 print("[LINE-ERR]", to, e)
 
-def send_all(text: str):
-    send_telegram(text)
-    send_line(text)
-
 
 # -------- Fetch rows ----------
 def has_result(t: Row) -> bool:
@@ -83,6 +87,27 @@ def fetch_rows_for(d: date) -> List[Row]:
     rows = [t for t in fw.extract_rows(data, key) if has_result(t)]
     rows.sort(key=lambda t: t[0])
     return rows
+
+
+# -------- Helper: slice ล่าสุด N รอบ และจัดให้เริ่มต้นที่ต้นบล็อก (4 รอบ) --------
+def slice_last_n_aligned(rows: List[Row], n: int) -> List[Row]:
+    """
+    ตัดเอา 'n รอบล่าสุด' แต่จะ **ขยับจุดเริ่ม** ให้ตรงต้นบล็อก (1–4, 5–8, …)
+    เพื่อให้คั่นเส้นออกมาเป็นบล็อก 4 รายการสวยงาม
+    """
+    if not rows or n <= 0:
+        return []
+
+    rows = sorted(rows, key=lambda t: t[0])
+    max_round = rows[-1][0]
+    start_round = max_round - n + 1
+    # ปรับให้ไปที่ 'หัวบล็อก'
+    start_round = ((start_round - 1) // 4) * 4 + 1
+    # ไม่ให้ต่ำกว่ารอบแรกที่มี
+    min_round = rows[0][0]
+    if start_round < min_round:
+        start_round = min_round
+    return [t for t in rows if t[0] >= start_round]
 
 
 # -------- Build message (locked 4-round blocks) ----------
@@ -102,12 +127,10 @@ def build_message_locked(rows: List[Row], add_footer: bool = True) -> str:
     for rn, hhmm, top3, bot2 in rows:
         block_id = (rn - 1) // 4
         if block_id != current_block:
-            # ปิด/เปิดคั่นเฉพาะเมื่อเข้า block ใหม่
             lines.append("➖➖➖➖➖➖➖")
             current_block = block_id
         lines.append(f"{rn:>3}: {hhmm} ➡️ {top3} - {bot2}")
 
-    # ปิดบล็อกสุดท้าย
     lines.append("➖➖➖➖➖➖➖")
 
     if add_footer:
@@ -119,6 +142,19 @@ def build_message_locked(rows: List[Row], add_footer: bool = True) -> str:
             "➖➖➖➖➖➖➖",
         ]
     return "\n".join(lines)
+
+
+# -------- สร้างข้อความแยกตามช่องทาง --------
+def build_for_telegram(rows_all: List[Row]) -> str:
+    limited = slice_last_n_aligned(rows_all, LIMIT_TG)
+    return build_message_locked(limited, add_footer=True)
+
+def build_for_line(rows_all: List[Row]) -> str:
+    if LIMIT_LINE:
+        limited = slice_last_n_aligned(rows_all, LIMIT_LINE)
+        return build_message_locked(limited, add_footer=True)
+    # ไม่จำกัด → ส่งทั้งวัน
+    return build_message_locked(rows_all, add_footer=True)
 
 
 # -------- Main loop ----------
@@ -133,7 +169,7 @@ def main():
     today = date.today()
     last_sent_round = 0  # กันส่งซ้ำ
 
-    print(f"[START] day={today} poll={poll}s  (locked blocks)")
+    print(f"[START] day={today} poll={poll}s  (locked blocks, TG limit {LIMIT_TG} rounds)")
 
     while True:
         try:
@@ -149,13 +185,20 @@ def main():
 
             if rows_all:
                 if args.force and last_sent_round == 0:
-                    send_all(build_message_locked(rows_all))
+                    # ส่งแยกตามช่องทาง
+                    tg_text = build_for_telegram(rows_all)
+                    ln_text = build_for_line(rows_all)
+                    if TG_TOKEN and TG_CHATS: send_telegram(tg_text)
+                    if LINE_TOKEN and LINE_TO: send_line(ln_text)
                     last_sent_round = rows_all[-1][0]
                     print(f"[SEND] init up to round={last_sent_round}")
 
                 # มีรอบใหม่หรือไม่
                 if rows_all[-1][0] > last_sent_round:
-                    send_all(build_message_locked(rows_all))
+                    tg_text = build_for_telegram(rows_all)
+                    ln_text = build_for_line(rows_all)
+                    if TG_TOKEN and TG_CHATS: send_telegram(tg_text)
+                    if LINE_TOKEN and LINE_TO: send_line(ln_text)
                     last_sent_round = rows_all[-1][0]
                     print(f"[SEND] up to round={last_sent_round}")
 
